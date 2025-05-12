@@ -1,0 +1,11 @@
+# Archivos y directorios a ignorar
+*.pyc
+__pycache__/
+venv/
+*.log
+.DS_Store
+.env
+
+# Puedes optar por excluir datos grandes
+data/raw/*
+outputs/*
