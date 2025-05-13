@@ -486,5 +486,58 @@ def main():
     logger.info(f"Event summary report created: {report_file}")
     print(f"\nProcessing completed. Results saved to: {output_dir}")
 
+    def save_clusters_csv(flash_df, output_dir, window_end):
+        """
+        Guarda un CSV con la información de clusters para diagnóstico.
+        
+        Args:
+            flash_df (pandas.DataFrame): DataFrame con datos de flashes incluyendo columna 'cluster'
+            output_dir (str): Directorio de salida
+            window_end (datetime): Tiempo de fin de la ventana
+        """
+        if 'cluster' not in flash_df.columns:
+            logger.warning("No cluster column in flash DataFrame, cannot save clusters CSV")
+            return
+        
+        # Crear directorio si no existe
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Nombre de archivo
+        timestamp_str = window_end.strftime('%Y%m%d_%H%M%S')
+        file_path = os.path.join(output_dir, f'clusters_{timestamp_str}.csv')
+        
+        # Contar flashes por cluster
+        cluster_counts = flash_df.groupby('cluster').size().reset_index(name='count')
+        
+        # Agregar coordenadas promedio
+        cluster_coords = flash_df.groupby('cluster').agg({
+            'flash_lon': 'mean',
+            'flash_lat': 'mean',
+            'flash_energy': 'sum'
+        }).reset_index()
+        
+        # Combinar datos
+        cluster_info = pd.merge(cluster_counts, cluster_coords, on='cluster')
+        
+        # Guardar CSV
+        cluster_info.to_csv(file_path, index=False)
+        logger.info(f"Saved clusters CSV to {file_path}")
+        
+        # También imprimir para diagnóstico inmediato
+        print(f"Clusters identified ({len(cluster_info)} total):")
+        print(cluster_info.sort_values('count', ascending=False).head(10))
+        
+        return file_path
+
+    # Luego, dentro de la función main() de process_historical_data.py,
+    # Después de identificar celdas, añadir:
+
+    # Identificar celdas
+    flash_df_with_clusters, cell_polygons, cell_stats = cell_identifier.identify_cells(flash_df)
+    cells_gdf = cell_identifier.create_cell_geodataframe(cell_polygons, cell_stats)
+
+    # Diagnóstico: guardar información de clusters
+    save_clusters_csv(flash_df_with_clusters, os.path.join(output_dir, 'diagnostics'), window_end)
+
 if __name__ == "__main__":
     main()

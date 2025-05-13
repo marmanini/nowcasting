@@ -108,9 +108,109 @@ class LightningVisualizer:
         if cells_gdf is not None and not cells_gdf.empty:
             cell_group = folium.FeatureGroup(name='Lightning Cells')
             
+            # Crear colores distintos para cada celda
+            import random
+            
+            # Lista de colores distintivos
+            colors = [
+                "#e6194B", "#3cb44b", "#ffe119", "#4363d8", "#f58231", 
+                "#911eb4", "#42d4f4", "#f032e6", "#bfef45", "#fabed4", 
+                "#469990", "#dcbeff", "#9A6324", "#fffac8", "#800000", 
+                "#aaffc3", "#808000", "#ffd8b1", "#000075", "#a9a9a9"
+            ]
+            
+            # Asignar un color a cada celda
+            unique_cells = cells_gdf['cell_id'].unique()
+            color_map = {}
+            
+            for i, cell_id in enumerate(unique_cells):
+                color_map[cell_id] = colors[i % len(colors)]
+            
+            # Imprimir diagnóstico
+            print(f"Visualizando {len(unique_cells)} celdas de tormenta")
+            
+            # Crear polígonos para cada celda
+            for _, cell in cells_gdf.iterrows():
+                # Obtener color para esta celda
+                color = color_map.get(cell['cell_id'], "#FF0000")  # Rojo por defecto
+                
+                # Información para popup
+                popup_text = f"""
+                <div style='width: 200px'>
+                    <h4>Storm Cell {cell['cell_id']}</h4>
+                    <b>Flashes:</b> {cell['n_flashes']}<br>
+                    <b>Area:</b> {cell['area_km2']:.2f} km²<br>
+                    <b>Energy:</b> {cell['total_energy']:.2f}
+                </div>
+                """
+                popup = folium.Popup(popup_text, max_width=300)
+                
+                # Convertir geometría a lista de coordenadas
+                if isinstance(cell.geometry, Polygon):
+                    coords = [(y, x) for x, y in list(cell.geometry.exterior.coords)]
+                    
+                    # Crear polígono con borde más grueso y colores más brillantes
+                    folium.Polygon(
+                        locations=coords,
+                        color=color,
+                        weight=4,         # Borde más grueso
+                        opacity=0.8,      # Borde más opaco
+                        fill=True,
+                        fill_opacity=0.5, # Relleno más opaco
+                        popup=popup
+                    ).add_to(cell_group)
+                    
+                    # Agregar marcador para el centroide
+                    folium.CircleMarker(
+                        location=[cell['centroid_lat'], cell['centroid_lon']],
+                        radius=6,
+                        color=color,
+                        fill=True,
+                        fill_opacity=0.8,
+                        popup=popup
+                    ).add_to(cell_group)
+            
+            # Añadir al mapa
+            cell_group.add_to(m)
+            
+            # Añadir leyenda
+            legend_html = """
+            <div style="position: fixed; bottom: 50px; right: 50px; width: 150px; z-index: 1000; background-color: white; 
+                        padding: 10px; border: 2px solid grey; border-radius: 5px; max-height: 300px; 
+                        overflow-y: auto;">
+            <p><b>Lightning Cells</b></p>
+            """
+            
+            # Limitar a 10 celdas en la leyenda para no sobrecargar
+            for i, (cell_id, color) in enumerate(list(color_map.items())[:10]):
+                legend_html += f"""
+                <div>
+                    <span style="background-color:{color}; width:15px; height:15px; display:inline-block; margin-right:5px;"></span>
+                    <span>Cell {cell_id}</span>
+                </div>
+                """
+            
+            if len(color_map) > 10:
+                legend_html += f"<div>+ {len(color_map) - 10} more cells</div>"
+            
+            legend_html += "</div>"
+            folium.Element(legend_html).add_to(m)
+            
             for _, cell in cells_gdf.iterrows():
                 # Color único para cada celda
-                color = f"#{hash(cell['cell_id']) % 0xFFFFFF:06x}"
+                color = color_map.get(cell['cell_id'], "#3388ff")
+                
+                # Mostrar información sobre el tamaño del cluster
+                popup_content = f"""
+                <div style='width: 200px'>
+                    <b>Cell ID:</b> {cell['cell_id']}<br>
+                    <b>Flashes:</b> {cell['n_flashes']}<br>
+                    <b>Area:</b> {cell['area_km2']:.2f} km²<br>
+                    <b>Energy:</b> {cell['total_energy']:.2f}
+                </div>
+                """
+                
+                popup = folium.Popup(popup_content, max_width=300)
                 
                 # Convertir geometría a lista de coordenadas
                 if isinstance(cell.geometry, Polygon):
@@ -120,10 +220,10 @@ class LightningVisualizer:
                     folium.Polygon(
                         locations=coords,
                         color=color,
-                        weight=2,
+                        weight=3,
                         fill=True,
-                        fill_opacity=0.2,
-                        popup=f"Cell ID: {cell['cell_id']}<br>Track ID: {cell.get('track_id', 'N/A')}<br>Flashes: {cell['n_flashes']}<br>Area: {cell['area_km2']:.2f} km²"
+                        fill_opacity=0.3,
+                        popup=popup
                     ).add_to(cell_group)
                     
                     # Agregar marcador para el centroide
@@ -133,7 +233,7 @@ class LightningVisualizer:
                         color=color,
                         fill=True,
                         fill_opacity=0.8,
-                        popup=f"Cell ID: {cell['cell_id']}<br>Track ID: {cell.get('track_id', 'N/A')}"
+                        popup=popup
                     ).add_to(cell_group)
             
             cell_group.add_to(m)
