@@ -1,0 +1,16 @@
+GLM Lightning Nowcasting - Event Summary
+=======================================
+
+Event Period: 2024-12-23 22:20:00 to 2024-12-23 23:00:00
+Processing Parameters:
+  - Time Window: 10 minutes
+  - Forecast Time: 20 minutes
+  - Clustering: eps=0.01, min_samples=5
+  - Max Tracking Distance: 30 km
+
+Summary Statistics:
+  - Windows Processed: 4
+  - Total Flashes: 0
+  - Unique Cells: 0
+  - Unique Tracks: 0
+

@@ -59,41 +59,91 @@ class FlashCellTracker:
         
         return distance
     
-    def _calculate_similarity(self, cell1, cell2):
+
+    def _predict_next_position(self, track_history):
         """
-        Calcula el índice de similitud entre dos celdas.
+        Predice la próxima posición de una tormenta basada en su trayectoria.
         
         Args:
-            cell1: Primera celda (registro de GeoDataFrame)
-            cell2: Segunda celda (registro de GeoDataFrame)
+            track_history: Lista de celdas históricas de un track
+                
+        Returns:
+            tuple: (pred_lon, pred_lat) - coordenadas predichas
+        """
+        if len(track_history) < 2:
+            return None, None
+        
+        # Obtener las últimas dos posiciones
+        last_cell = track_history[-1]
+        prev_cell = track_history[-2]
+        
+        # Calcular vector de velocidad
+        time_diff = (pd.to_datetime(last_cell['end_time']) - 
+                    pd.to_datetime(prev_cell['end_time'])).total_seconds() / 60.0
+        
+        if time_diff <= 0:
+            return None, None
+        
+        # Calcular velocidad en grados por minuto
+        vel_lon = (last_cell['centroid_lon'] - prev_cell['centroid_lon']) / time_diff
+        vel_lat = (last_cell['centroid_lat'] - prev_cell['centroid_lat']) / time_diff
+        
+        # Predecir próxima posición (10 minutos más tarde)
+        pred_lon = last_cell['centroid_lon'] + vel_lon * 10
+        pred_lat = last_cell['centroid_lat'] + vel_lat * 10
+        
+        return pred_lon, pred_lat
+
+    def _calculate_similarity(self, cell1, cell2):
+        """
+        Calcula el índice de similitud entre dos celdas, con mejoras para considerar
+        el movimiento típico de tormentas.
+        
+        Args:
+            cell1: Primera celda (celda previa)
+            cell2: Segunda celda (celda actual)
             
         Returns:
             float: Índice de similitud (0-1, mayor es más similar)
         """
-        # Calcular distancia entre centroides
+        # 1. Calcular distancia entre centroides
         distance = self._calculate_distance(
             cell1['centroid_lon'], cell1['centroid_lat'],
             cell2['centroid_lon'], cell2['centroid_lat']
         )
         
-        # Normalizar distancia (0 = misma posición, 1 = distancia máxima)
-        distance_factor = 1 - min(distance / self.max_distance_km, 1)
+        # Si la distancia es extremadamente grande, descartar inmediatamente
+        if distance > self.max_distance_km * 1.2:
+            return 0.0
         
-        # Calcular solapamiento geométrico si es posible
-        try:
-            if cell1['geometry'].intersects(cell2['geometry']):
-                intersection = cell1['geometry'].intersection(cell2['geometry']).area
-                union = cell1['geometry'].union(cell2['geometry']).area
-                overlap_factor = intersection / union
-            else:
-                overlap_factor = 0
-        except:
-            overlap_factor = 0
+        # Normalizar distancia (1 = cerca, 0 = lejos)
+        # Usar una función exponencial para dar más peso a distancias cortas
+        distance_factor = np.exp(-distance / (self.max_distance_km/2))
         
-        # Calcular similitud ponderada
+        # 2. Calcular similitud de tamaño (área)
+        area_ratio = min(cell1['area_km2'], cell2['area_km2']) / max(cell1['area_km2'], cell2['area_km2'])
+        
+        # 3. Calcular similitud de intensidad (rayos)
+        flash_ratio = min(cell1['n_flashes'], cell2['n_flashes']) / max(cell1['n_flashes'], cell2['n_flashes'])
+        
+        # 4. Verificar solapamiento solo si están relativamente cerca
+        overlap_factor = 0.0
+        if distance < self.max_distance_km * 0.7:
+            try:
+                if cell1['geometry'].intersects(cell2['geometry']):
+                    intersection = cell1['geometry'].intersection(cell2['geometry']).area
+                    union = cell1['geometry'].union(cell2['geometry']).area
+                    overlap_factor = intersection / union
+            except:
+                pass
+        
+        # 5. Calcular similitud ponderada
+        # La distancia es el factor más importante, luego la intensidad/tamaño
         similarity = (
-            (1 - self.time_weight - self.overlap_weight) * distance_factor +
-            self.overlap_weight * overlap_factor
+            0.5 * distance_factor +  # Distancia (50%)
+            0.2 * flash_ratio +      # Similitud de intensidad (20%)
+            0.1 * area_ratio +       # Similitud de tamaño (10%)
+            0.2 * overlap_factor     # Solapamiento (20%)
         )
         
         return similarity
@@ -151,13 +201,29 @@ class FlashCellTracker:
                 # Calcular similitud
                 similarity = self._calculate_similarity(current_cell, last_cell)
                 
+                # Añadir este código nuevo para mejorar la similitud con predicción
+                if len(track_history) >= 2:
+                    pred_lon, pred_lat = self._predict_next_position(track_history)
+                    
+                    if pred_lon is not None and pred_lat is not None:
+                        # Calcular distancia a la posición predicha
+                        pred_distance = self._calculate_distance(
+                            current_cell['centroid_lon'], current_cell['centroid_lat'],
+                            pred_lon, pred_lat
+                        )
+                        
+                        # Bonus de similitud si está cerca de la posición predicha (hasta 0.2 adicional)
+                        if pred_distance < self.max_distance_km * 0.8:
+                            bonus = 0.2 * (1 - pred_distance / (self.max_distance_km * 0.8))
+                            similarity += bonus
+                
                 # Actualizar mejor coincidencia
                 if similarity > best_similarity:
                     best_similarity = similarity
                     best_match = track_id
             
-            # Si encontramos una coincidencia con similitud suficiente
-            if best_similarity > 0.3:  # Umbral ajustable
+            # Y aquí reduce el umbral para ser más permisivo
+            if best_similarity > 0.15:  # Cambia de 0.3 a 0.15
                 matches.append((current_idx, best_match, best_similarity))
         
         # Resolver conflictos (varias celdas actuales coinciden con el mismo track)

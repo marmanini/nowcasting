@@ -19,8 +19,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 # Importar componentes
 from src.data.glm_processor import GLMProcessor
 from src.models.flash_cell_identification import FlashCellIdentifier
-from src.models.improved_flash_cell_tracking import ImprovedFlashCellTracker as FlashCellTracker
-from src.models.improved_flash_cell_nowcasting import ImprovedFlashCellNowcaster as FlashCellNowcaster
+from src.models.flash_cell_tracking import FlashCellTracker
+from src.models.flash_cell_nowcasting import FlashCellNowcaster
 from src.visualization.maps import LightningVisualizer
 
 # Configuración de logging

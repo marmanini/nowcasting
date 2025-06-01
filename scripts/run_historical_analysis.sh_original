@@ -31,13 +31,6 @@ if [ $# -lt 2 ]; then
     echo "  --animation            Crear animación del evento"
     echo "  --validation           Realizar validación de predicciones"
     echo "  --debug                Habilitar logging de depuración"
-    # NUEVAS OPCIONES AÑADIDAS
-    echo "  --eps N                Parámetro eps para DBSCAN (default: 0.05)"
-    echo "  --min_samples N        Parámetro min_samples para DBSCAN (default: 5)"
-    echo "  --use-advanced-models  Usar modelos avanzados de ML para predicciones"
-    echo "  --show-uncertainty     Mostrar información de incertidumbre"
-    echo "  --predict-shape        Predecir evolución de forma de celdas"
-    echo "  --evaluate             Realizar evaluación detallada de predicciones"
     echo ""
     exit 1
 fi
@@ -146,10 +139,7 @@ if [[ $DOWNLOAD_DATA =~ ^[Ss]$ ]]; then
     echo "Descarga de datos completada."
 fi
 
-# Definir variable para la extracción de parámetros
-prev_arg=""
-
-# Ejecutar el script de procesamiento con todos los argumentos
+# Ejecutar el script de procesamiento
 echo "Ejecutando análisis de datos históricos..."
 python ${NOWCASTING_DIR}/scripts/process_historical_data.py \
     --data_dir "${DATA_DIR}" \
