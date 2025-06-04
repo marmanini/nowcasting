@@ -521,13 +521,16 @@ class ConsolidatedNowcastingSystem:
             return None
 
 
+    # FUNCIÓN CORREGIDA - ELIMINAR DUPLICACIÓN
+
     def _create_animated_consolidated_map(self):
-        """Crea mapa consolidado con animación temporal Y todos los paneles de información."""
+        """Crea mapa con lógica temporal correcta: pasado=líneas, presente=área, futuro=cono."""
         
         import folium
         from folium.plugins import TimestampedGeoJson, MeasureControl
         import branca.colormap as cm
         from shapely.geometry import Polygon
+        import math
         
         # DEBUG: Verificar datos disponibles
         logger.info(f"🔍 DEBUG: Ventanas de datos disponibles: {len(self.historical_data)}")
@@ -588,6 +591,9 @@ class ConsolidatedNowcastingSystem:
                 📅 {start_time.strftime('%Y-%m-%d %H:%M')} → {end_time.strftime('%H:%M UTC')} 
                 | 📊 {len(self.historical_data)} ventanas | ⏱️ {len(self.historical_data) * 10} minutos
             </div>
+            <div style="margin-top: 3px; font-size: 12px; color: #888;">
+                🕐 Pasado: líneas | 🕑 Presente: áreas | 🕒 Futuro: conos de probabilidad
+            </div>
         </div>
         '''
         m.get_root().html.add_child(folium.Element(title_html))
@@ -598,172 +604,241 @@ class ConsolidatedNowcastingSystem:
         self._add_verification_panel(m)
         self._add_uncertainty_legend_to_map(m)
         
-        # PREPARAR FEATURES PARA ANIMACIÓN
-        features = []
+        # COLORES PARA TRACKS
         colors = [
             "#FF0000", "#00FF00", "#0000FF", "#FFFF00", "#FF00FF", 
             "#00FFFF", "#FF8000", "#8000FF", "#0080FF", "#FF0080",
             "#80FF00", "#00FF80", "#FF8080", "#80FF80", "#8080FF"
         ]
         
-        total_features_added = 0
+        # RECOPILAR TODOS LOS TRACKS Y SUS POSICIONES TEMPORALES
+        logger.info("🔄 Organizando datos temporales por tracks...")
+        track_history = {}  # track_id -> lista de posiciones ordenadas por tiempo
         
-        # Procesar cada ventana temporal
         for window_idx, window_data in enumerate(self.historical_data):
             timestamp = window_data['timestamp']
-            time_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
-            
             cells_gdf = window_data.get('cells_gdf', pd.DataFrame())
             predictions_df = window_data.get('predictions_df', pd.DataFrame())
             
-            logger.info(f"🔄 Procesando ventana {window_idx}: {timestamp.strftime('%H:%M')} - {len(cells_gdf)} celdas, {len(predictions_df)} predicciones")
-            
-            # AGREGAR CELDAS DETECTADAS
             if not cells_gdf.empty:
-                for idx, cell in cells_gdf.iterrows():
-                    try:
-                        # Verificar que tiene geometría válida
-                        if hasattr(cell, 'geometry') and cell.geometry is not None:
-                            
-                            track_id = cell.get('track_id', idx)
-                            color = colors[int(track_id) % len(colors)]
-                            
-                            # Información de la celda
-                            popup_info = f"""
-                            <div style="font-family: Arial; width: 250px;">
-                                <h4 style="color: {color};">⛈️ Celda #{cell.get('cell_id', idx)}</h4>
-                                <b>Track ID:</b> {track_id}<br>
-                                <b>Rayos:</b> {cell.get('n_flashes', 'N/A')}<br>
-                                <b>Área:</b> {cell.get('area_km2', 0):.1f} km²<br>
-                                <b>Tiempo:</b> {timestamp.strftime('%H:%M:%S')}<br>
-                                <b>Posición:</b> [{cell.get('centroid_lat', 0):.4f}, {cell.get('centroid_lon', 0):.4f}]
-                            </div>
-                            """
-                            
-                            # Feature para el polígono (si es válido)
-                            if isinstance(cell.geometry, Polygon):
-                                features.append({
-                                    'type': 'Feature',
-                                    'geometry': cell.geometry.__geo_interface__,
-                                    'properties': {
-                                        'time': time_str,
-                                        'style': {
-                                            'color': color,
-                                            'weight': 3,
-                                            'fillColor': color,
-                                            'fillOpacity': 0.6
-                                        },
-                                        'popup': popup_info
-                                    }
-                                })
-                                total_features_added += 1
-                            
-                            # Feature para el centroide
-                            if 'centroid_lat' in cell and 'centroid_lon' in cell:
-                                features.append({
-                                    'type': 'Feature',
-                                    'geometry': {
-                                        'type': 'Point',
-                                        'coordinates': [cell['centroid_lon'], cell['centroid_lat']]
-                                    },
-                                    'properties': {
-                                        'time': time_str,
-                                        'icon': 'circle',
-                                        'iconstyle': {
-                                            'fillColor': 'white',
-                                            'fillOpacity': 1.0,
-                                            'stroke': True,
-                                            'color': color,
-                                            'weight': 2,
-                                            'radius': 8
-                                        },
-                                        'popup': popup_info
-                                    }
-                                })
-                                total_features_added += 1
-                            
-                    except Exception as e:
-                        logger.warning(f"⚠️ Error procesando celda {idx}: {e}")
-                        continue
+                for _, cell in cells_gdf.iterrows():
+                    track_id = cell.get('track_id', -1)
+                    if track_id != -1:
+                        if track_id not in track_history:
+                            track_history[track_id] = []
+                        
+                        track_history[track_id].append({
+                            'window_idx': window_idx,
+                            'timestamp': timestamp,
+                            'cell_data': cell,
+                            'predictions': predictions_df[predictions_df['track_id'] == track_id] if not predictions_df.empty else pd.DataFrame()
+                        })
+        
+        # Ordenar por tiempo cada track
+        for track_id in track_history:
+            track_history[track_id].sort(key=lambda x: x['timestamp'])
+        
+        logger.info(f"📊 Tracks organizados: {len(track_history)} tracks únicos")
+        
+        # FUNCIÓN AUXILIAR: Interpolar puntos entre dos posiciones
+        def interpolate_points(lat1, lon1, lat2, lon2, num_points=8):
+            """Crea puntos intermedios entre dos posiciones para simular una línea."""
+            points = []
+            for i in range(num_points + 1):
+                ratio = i / num_points if num_points > 0 else 0
+                lat = lat1 + (lat2 - lat1) * ratio
+                lon = lon1 + (lon2 - lon1) * ratio
+                points.append([lat, lon])
+            return points
+        
+        # INICIALIZAR FEATURES UNA SOLA VEZ
+        features = []
+        total_features_added = 0
+        
+        # PROCESAMIENTO ÚNICO: LÍNEAS SIMULADAS + ÁREAS + CONOS + PREDICCIONES
+        for current_window_idx, window_data in enumerate(self.historical_data):
+            current_timestamp = window_data['timestamp']
+            time_str = current_timestamp.strftime('%Y-%m-%d %H:%M:%S')
             
-            # AGREGAR PREDICCIONES
-            if not predictions_df.empty:
-                for idx, pred in predictions_df.iterrows():
-                    try:
-                        if 'pred_lat' in pred and 'pred_lon' in pred:
-                            track_id = pred.get('track_id', idx)
-                            color = colors[int(track_id) % len(colors)]
+            logger.info(f"🕐 Procesando momento temporal {current_window_idx}: {current_timestamp.strftime('%H:%M')}")
+            
+            # Para cada track, procesar TODAS sus features en un solo lugar
+            for track_id, track_positions in track_history.items():
+                color = colors[int(track_id) % len(colors)]
+                
+                # Encontrar todas las posiciones hasta el momento actual (inclusive)
+                positions_until_now = [
+                    pos for pos in track_positions 
+                    if pos['timestamp'] <= current_timestamp
+                ]
+                
+                # 1. LÍNEAS SIMULADAS CON PUNTOS (si hay múltiples posiciones)
+                if len(positions_until_now) >= 2:
+                    logger.info(f"   Track {track_id}: creando línea simulada con {len(positions_until_now)} segmentos")
+                    
+                    # Crear puntos interpolados entre cada par de posiciones consecutivas
+                    all_line_points = []
+                    for i in range(len(positions_until_now) - 1):
+                        pos1 = positions_until_now[i]
+                        pos2 = positions_until_now[i + 1]
+                        
+                        lat1 = pos1['cell_data']['centroid_lat']
+                        lon1 = pos1['cell_data']['centroid_lon']
+                        lat2 = pos2['cell_data']['centroid_lat']
+                        lon2 = pos2['cell_data']['centroid_lon']
+                        
+                        # Interpolar 8 puntos entre cada par de posiciones (más denso)
+                        interpolated = interpolate_points(lat1, lon1, lat2, lon2, 8)
+                        all_line_points.extend(interpolated)
+                    
+                    # Crear un punto pequeño para cada posición interpolada
+                    for point_idx, (lat, lon) in enumerate(all_line_points):
+                        line_point_feature = {
+                            'type': 'Feature',
+                            'geometry': {
+                                'type': 'Point',
+                                'coordinates': [lon, lat]
+                            },
+                            'properties': {
+                                'time': time_str,
+                                'icon': 'circle',
+                                'iconstyle': {
+                                    'fillColor': '#006400',    # Verde oscuro
+                                    'fillOpacity': 0.9,         # Más opaco
+                                    'stroke': False,            # Sin borde
+                                    'radius': 3                 # Un poco más grande
+                                },
+                                'popup': f'🛤️ Trayectoria Track {track_id} - Punto {point_idx+1}'
+                            }
+                        }
+                        
+                        features.append(line_point_feature)
+                        total_features_added += 1
+                
+                # 2. PUNTOS PRINCIPALES DE POSICIÓN
+                if positions_until_now:
+                    for i, pos in enumerate(positions_until_now):
+                        # Punto principal de posición (más grande y distintivo)
+                        main_point_feature = {
+                            'type': 'Feature',
+                            'geometry': {
+                                'type': 'Point',
+                                'coordinates': [pos['cell_data']['centroid_lon'], pos['cell_data']['centroid_lat']]
+                            },
+                            'properties': {
+                                'time': time_str,
+                                'icon': 'circle',
+                                'iconstyle': {
+                                    'fillColor': '#00FF00' if i == len(positions_until_now)-1 else '#228B22',
+                                    'fillOpacity': 1.0,
+                                    'stroke': True,
+                                    'color': 'white',
+                                    'weight': 2,
+                                    'radius': 8 if i == len(positions_until_now)-1 else 5
+                                },
+                                'popup': f'📍 Track {track_id} - Posición {i+1} ({pos["timestamp"].strftime("%H:%M")})'
+                            }
+                        }
+                        
+                        features.append(main_point_feature)
+                        total_features_added += 1
+                
+                # 3. ÁREA DE TORMENTA ACTUAL (SOLO TIEMPO PRESENTE)
+                current_position = next(
+                    (pos for pos in positions_until_now if pos['timestamp'] == current_timestamp), 
+                    None
+                )
+                
+                if current_position:
+                    cell_data = current_position['cell_data']
+                    
+                    # Área/polígono de la tormenta actual
+                    if hasattr(cell_data, 'geometry') and cell_data.geometry is not None:
+                        if isinstance(cell_data.geometry, Polygon):
                             
-                            confidence = pred.get('confidence_percentage', pred.get('confidence_level', 0.75))
-                            if confidence <= 1.0:
-                                confidence *= 100
-                            
-                            pred_popup = f"""
-                            <div style="font-family: Arial; width: 250px;">
-                                <h4 style="color: {color};">🔮 Predicción - Track #{track_id}</h4>
-                                <b>Confianza:</b> {confidence:.1f}%<br>
-                                <b>Posición predicha:</b> [{pred['pred_lat']:.4f}, {pred['pred_lon']:.4f}]<br>
-                                <b>Método:</b> {pred.get('forecast_method', 'Linear')}<br>
-                                <b>Lead time:</b> {pred.get('lead_time_min', 20)} min
+                            cell_popup = f"""
+                            <div style="font-family: Arial; width: 260px;">
+                                <h4 style="color: {color};">⛈️ Tormenta Actual - Track #{track_id}</h4>
+                                <div style="background-color: #fff3cd; padding: 6px; border-radius: 4px; margin: 4px 0;">
+                                    <b>⚡ Rayos:</b> {cell_data.get('n_flashes', 'N/A')}<br>
+                                    <b>📏 Área:</b> {cell_data.get('area_km2', 0):.1f} km²<br>
+                                    <b>🔋 Energía total:</b> {cell_data.get('total_energy', 0):.1e}<br>
+                                    <b>👴 Edad:</b> {cell_data.get('age_minutes', 0):.1f} min
+                                </div>
+                                <div style="background-color: #f8f9fa; padding: 6px; border-radius: 4px; margin: 4px 0;">
+                                    <b>🕐 Tiempo:</b> {current_timestamp.strftime('%H:%M:%S')}<br>
+                                    <b>📍 Centro:</b> [{cell_data.get('centroid_lat', 0):.4f}, {cell_data.get('centroid_lon', 0):.4f}]<br>
+                                    <b>🚗 Velocidad:</b> {cell_data.get('velocity_kmh', 0):.1f} km/h
+                                </div>
                             </div>
                             """
                             
-                            # Feature para posición predicha
+                            # Polígono de la tormenta (solo en tiempo presente) - COLOR AZUL
                             features.append({
                                 'type': 'Feature',
-                                'geometry': {
-                                    'type': 'Point',
-                                    'coordinates': [pred['pred_lon'], pred['pred_lat']]
-                                },
+                                'geometry': cell_data.geometry.__geo_interface__,
                                 'properties': {
                                     'time': time_str,
-                                    'icon': 'circle',
-                                    'iconstyle': {
-                                        'fillColor': '#FF00FF',
-                                        'fillOpacity': 0.8,
-                                        'stroke': True,
-                                        'color': 'white',
-                                        'weight': 3,
-                                        'radius': 10
+                                    'style': {
+                                        'color': '#0000FF',        # AZUL para perímetro
+                                        'weight': 4,               # PERÍMETRO MÁS RESALTADO
+                                        'fillColor': '#0000FF',    # AZUL para relleno
+                                        'fillOpacity': 0.4         # ALPHA 0.4 como solicitado
                                     },
-                                    'popup': pred_popup
+                                    'popup': cell_popup
                                 }
                             })
                             total_features_added += 1
-                            
-                            # Línea de trayectoria si hay posición anterior
-                            if 'last_lat' in pred and 'last_lon' in pred:
-                                features.append({
-                                    'type': 'Feature',
-                                    'geometry': {
-                                        'type': 'LineString',
-                                        'coordinates': [
-                                            [pred['last_lon'], pred['last_lat']],
-                                            [pred['pred_lon'], pred['pred_lat']]
-                                        ]
-                                    },
-                                    'properties': {
-                                        'time': time_str,
-                                        'style': {
-                                            'color': color,
-                                            'weight': 4,
-                                            'opacity': 0.8,
-                                            'dashArray': '8, 4'
-                                        },
-                                        'popup': pred_popup
-                                    }
-                                })
-                                total_features_added += 1
                     
-                    except Exception as e:
-                        logger.warning(f"⚠️ Error procesando predicción {idx}: {e}")
-                        continue
-        
-        logger.info(f"✅ Total de features agregados: {total_features_added}")
+                    # 4. CENTROIDE DE LA TORMENTA ACTUAL
+                    if 'centroid_lat' in cell_data and 'centroid_lon' in cell_data:
+                        features.append({
+                            'type': 'Feature',
+                            'geometry': {
+                                'type': 'Point',
+                                'coordinates': [cell_data['centroid_lon'], cell_data['centroid_lat']]
+                            },
+                            'properties': {
+                                'time': time_str,
+                                'icon': 'circle',
+                                'iconstyle': {
+                                    'fillColor': 'white',
+                                    'fillOpacity': 1.0,
+                                    'stroke': True,
+                                    'color': color,
+                                    'weight': 3,
+                                    'radius': 8
+                                },
+                                'popup': cell_popup
+                            }
+                        })
+                        total_features_added += 1
+                    
+                    # 5. CONO DE INCERTIDUMBRE FUTURO (PRONÓSTICO)
+                    predictions = current_position['predictions']
+                    if not predictions.empty:
+                        prediction = predictions.iloc[0]  # Tomar primera predicción
+                        
+                        # Generar cono de incertidumbre con múltiples niveles de probabilidad
+                        uncertainty_features = self._generate_uncertainty_cone(
+                            current_lat=cell_data['centroid_lat'],
+                            current_lon=cell_data['centroid_lon'], 
+                            predicted_lat=prediction.get('pred_lat', cell_data['centroid_lat']),
+                            predicted_lon=prediction.get('pred_lon', cell_data['centroid_lon']),
+                            time_str=time_str,
+                            track_id=track_id,
+                            color=color,
+                            prediction_data=prediction
+                        )
+                        
+                        features.extend(uncertainty_features)
+                        total_features_added += len(uncertainty_features)
+
+        logger.info(f"✅ Total features procesados: {total_features_added}")
         
         if total_features_added == 0:
             logger.error("❌ No se pudieron agregar features al mapa")
-            return m  # Retornar mapa básico sin animación
+            return m
         
         # CREAR ANIMACIÓN TEMPORAL
         try:
@@ -772,47 +847,530 @@ class ConsolidatedNowcastingSystem:
                     'type': 'FeatureCollection',
                     'features': features
                 },
-                period='PT10M',  # Intervalo de 10 minutos
-                duration='PT5M',  # Duración de transición
-                auto_play=False,  # No empezar automáticamente
+                period='PT10M',          # Cada 10 minutos (ventanas reales)
+                duration='PT8M',         # Transición de 8 minutos
+                auto_play=True,
                 loop=True,
-                max_speed=2,
+                max_speed=1,
                 loop_button=True,
                 date_options='YYYY-MM-DD HH:mm:ss',
                 time_slider_drag_update=True
             )
             
             timestamped_geojson.add_to(m)
-            logger.info("✅ Animación temporal agregada al mapa")
+            logger.info("✅ Animación temporal con lógica correcta agregada al mapa")
             
         except Exception as e:
             logger.error(f"❌ Error creando animación temporal: {e}")
-            logger.info("📝 Agregando features como capas estáticas...")
-            
-            # Fallback: agregar como capas estáticas
-            for feature in features[-20:]:  # Solo últimos 20 features
-                try:
-                    if feature['geometry']['type'] == 'Point':
-                        folium.CircleMarker(
-                            location=[feature['geometry']['coordinates'][1], feature['geometry']['coordinates'][0]],
-                            radius=8,
-                            popup=feature['properties'].get('popup', 'Sin información'),
-                            color=feature['properties']['style'].get('color', 'blue') if 'style' in feature['properties'] else 'blue',
-                            fillColor=feature['properties']['style'].get('fillColor', 'blue') if 'style' in feature['properties'] else 'blue',
-                            fillOpacity=0.7
-                        ).add_to(m)
-                    elif feature['geometry']['type'] == 'Polygon':
-                        folium.GeoJson(
-                            feature,
-                            style_function=lambda x: feature['properties']['style']
-                        ).add_to(m)
-                except Exception as e:
-                    logger.warning(f"⚠️ Error agregando feature estático: {e}")
+            return m
         
         # AGREGAR CONTROLES
         folium.LayerControl().add_to(m)
         
         return m
+
+    def _calculate_trajectory_distance(self, positions):
+        """Calcula la distancia total de una trayectoria."""
+        total_distance = 0
+        for i in range(1, len(positions)):
+            lat1 = positions[i-1]['cell_data']['centroid_lat']
+            lon1 = positions[i-1]['cell_data']['centroid_lon']
+            lat2 = positions[i]['cell_data']['centroid_lat']
+            lon2 = positions[i]['cell_data']['centroid_lon']
+            
+            distance = self._calculate_distance_km(lat1, lon1, lat2, lon2)
+            total_distance += distance
+        
+        return total_distance
+
+    def _calculate_distance_km(self, lat1, lon1, lat2, lon2):
+        """Calcula distancia entre dos puntos en km."""
+        lat_diff = lat2 - lat1
+        lon_diff = lon2 - lon1
+        lat_km = lat_diff * 111.0
+        lon_km = lon_diff * 111.0 * np.cos(np.radians((lat1 + lat2) / 2))
+        return (lat_km**2 + lon_km**2)**0.5
+
+    def _generate_uncertainty_cone(self, current_lat, current_lon, predicted_lat, predicted_lon, 
+                                time_str, track_id, color, prediction_data):
+        """Genera cono de incertidumbre con probabilidades 60%, 80%, 90% en ROJO."""
+        features = []
+        
+        # Configuración de incertidumbre - COLORES ROJOS
+        base_error_km = prediction_data.get('expected_error_km', 5.0)
+        confidence_levels = [
+            {'probability': 60, 'multiplier': 1.0, 'opacity': 0.6, 'color': '#FF0000'},  # Rojo más opaco
+            {'probability': 80, 'multiplier': 1.5, 'opacity': 0.4, 'color': '#FF0000'}, # Rojo medio
+            {'probability': 90, 'multiplier': 2.0, 'opacity': 0.25, 'color': '#FF0000'} # Rojo más transparente
+        ]
+        
+        # Calcular dirección del movimiento
+        direction_lat = predicted_lat - current_lat
+        direction_lon = predicted_lon - current_lon
+        prediction_distance_km = self._calculate_distance_km(current_lat, current_lon, predicted_lat, predicted_lon)
+        
+        # Si no hay movimiento significativo, usar círculos concéntricos ROJOS
+        if prediction_distance_km < 1.0:
+            for level in confidence_levels:
+                radius_km = base_error_km * level['multiplier']
+                circle_coords = self._create_uncertainty_circle(predicted_lat, predicted_lon, radius_km)
+                
+                uncertainty_popup = f"""
+                <div style="font-family: Arial; width: 240px;">
+                    <h4 style="color: {level['color']};">🎯 Incertidumbre {level['probability']}% - Track #{track_id}</h4>
+                    <div style="background-color: #ffe0e0; padding: 6px; border-radius: 4px;">
+                        <b>📊 Probabilidad:</b> {level['probability']}%<br>
+                        <b>📏 Radio:</b> ±{radius_km:.1f} km<br>
+                        <b>🎯 Tipo:</b> Zona estacionaria<br>
+                        <b>🔮 Método:</b> {prediction_data.get('forecast_method', 'Linear')}
+                    </div>
+                </div>
+                """
+                
+                features.append({
+                    'type': 'Feature',
+                    'geometry': {
+                        'type': 'Polygon',
+                        'coordinates': [circle_coords]
+                    },
+                    'properties': {
+                        'time': time_str,
+                        'style': {
+                            'color': level['color'],           # ROJO para perímetro
+                            'weight': 2,
+                            'fillColor': level['color'],       # ROJO para relleno
+                            'fillOpacity': level['opacity']    # Transparencia variable
+                        },
+                        'popup': uncertainty_popup
+                    }
+                })
+        
+        else:
+            # Crear cono de incertidumbre direccional ROJO
+            for level in confidence_levels:
+                cone_coords = self._create_uncertainty_cone_coords(
+                    current_lat, current_lon,
+                    predicted_lat, predicted_lon,
+                    base_error_km * level['multiplier']
+                )
+                
+                uncertainty_popup = f"""
+                <div style="font-family: Arial; width: 260px;">
+                    <h4 style="color: {level['color']};">🌪️ Cono de Incertidumbre {level['probability']}% - Track #{track_id}</h4>
+                    <div style="background-color: #ffe0e0; padding: 6px; border-radius: 4px; margin: 4px 0;">
+                        <b>📊 Probabilidad:</b> {level['probability']}%<br>
+                        <b>📏 Error máximo:</b> ±{base_error_km * level['multiplier']:.1f} km<br>
+                        <b>🚗 Distancia pronóstico:</b> {prediction_distance_km:.1f} km<br>
+                        <b>⏱️ Lead time:</b> {prediction_data.get('lead_time_min', 20)} min
+                    </div>
+                    <div style="background-color: #fff0f0; padding: 6px; border-radius: 4px; margin: 4px 0;">
+                        <b>🎯 Desde:</b> [{current_lat:.4f}, {current_lon:.4f}]<br>
+                        <b>🎯 Hacia:</b> [{predicted_lat:.4f}, {predicted_lon:.4f}]<br>
+                        <b>🔮 Método:</b> {prediction_data.get('forecast_method', 'Linear')}<br>
+                        <b>🎲 Confianza:</b> {prediction_data.get('confidence_level', 0.75)*100:.1f}%
+                    </div>
+                </div>
+                """
+                
+                features.append({
+                    'type': 'Feature',
+                    'geometry': {
+                        'type': 'Polygon',
+                        'coordinates': [cone_coords]
+                    },
+                    'properties': {
+                        'time': time_str,
+                        'style': {
+                            'color': level['color'],           # ROJO para perímetro
+                            'weight': 2,
+                            'fillColor': level['color'],       # ROJO para relleno  
+                            'fillOpacity': level['opacity']    # Transparencia variable
+                        },
+                        'popup': uncertainty_popup
+                    }
+                })
+        
+        # Agregar punto de predicción central - MANTENER MAGENTA
+        prediction_popup = f"""
+        <div style="font-family: Arial; width: 220px;">
+            <h4 style="color: #FF00FF;">🔮 Pronóstico Central - Track #{track_id}</h4>
+            <div style="background-color: #f0f8ff; padding: 6px; border-radius: 4px;">
+                <b>📍 Posición predicha:</b> [{predicted_lat:.4f}, {predicted_lon:.4f}]<br>
+                <b>⏱️ Lead time:</b> {prediction_data.get('lead_time_min', 20)} min<br>
+                <b>🎲 Confianza:</b> {prediction_data.get('confidence_level', 0.75)*100:.1f}%<br>
+                <b>📏 Error esperado:</b> ±{base_error_km:.1f} km
+            </div>
+        </div>
+        """
+        
+        features.append({
+            'type': 'Feature',
+            'geometry': {
+                'type': 'Point',
+                'coordinates': [predicted_lon, predicted_lat]
+            },
+            'properties': {
+                'time': time_str,
+                'icon': 'circle',
+                'iconstyle': {
+                    'fillColor': '#FF00FF',        # MANTENER MAGENTA para punto central
+                    'fillOpacity': 1.0,
+                    'stroke': True,
+                    'color': 'white',
+                    'weight': 3,
+                    'radius': 10
+                },
+                'popup': prediction_popup
+            }
+        })
+        
+        return features
+
+    def _create_uncertainty_circle(self, center_lat, center_lon, radius_km, num_points=24):
+        """Crea coordenadas para un círculo de incertidumbre."""
+        lat_radius = radius_km / 111.0
+        lon_radius = radius_km / (111.0 * np.cos(np.radians(center_lat)))
+        
+        circle_points = []
+        for angle in np.linspace(0, 2*np.pi, num_points):
+            lat = center_lat + lat_radius * np.sin(angle)
+            lon = center_lon + lon_radius * np.cos(angle)
+            circle_points.append([lon, lat])
+        
+        circle_points.append(circle_points[0])  # Cerrar el polígono
+        return circle_points
+
+    def _create_uncertainty_cone_coords(self, current_lat, current_lon, predicted_lat, predicted_lon, max_error_km):
+        """Crea coordenadas para un cono de incertidumbre direccional."""
+        import math
+        
+        # Vector de dirección
+        direction_lat = predicted_lat - current_lat
+        direction_lon = predicted_lon - current_lon
+        
+        # Normalizar dirección
+        distance = math.sqrt(direction_lat**2 + direction_lon**2)
+        if distance == 0:
+            return self._create_uncertainty_circle(predicted_lat, predicted_lon, max_error_km)
+        
+        unit_lat = direction_lat / distance
+        unit_lon = direction_lon / distance
+        
+        # Vector perpendicular
+        perp_lat = -unit_lon
+        perp_lon = unit_lat
+        
+        # Conversión a km
+        lat_to_km = 111.0
+        lon_to_km = 111.0 * np.cos(np.radians((current_lat + predicted_lat) / 2))
+        
+        # Crear cono: estrecho en origen, ancho en destino
+        origin_width_km = max_error_km * 0.2  # 20% del error en el origen
+        dest_width_km = max_error_km          # 100% del error en destino
+        
+        # Puntos del cono
+        cone_points = []
+        
+        # Lado izquierdo del cono
+        left_origin_lat = current_lat + (perp_lat * origin_width_km / lat_to_km)
+        left_origin_lon = current_lon + (perp_lon * origin_width_km / lon_to_km)
+        left_dest_lat = predicted_lat + (perp_lat * dest_width_km / lat_to_km)
+        left_dest_lon = predicted_lon + (perp_lon * dest_width_km / lon_to_km)
+        
+        # Lado derecho del cono
+        right_origin_lat = current_lat - (perp_lat * origin_width_km / lat_to_km)
+        right_origin_lon = current_lon - (perp_lon * origin_width_km / lon_to_km)
+        right_dest_lat = predicted_lat - (perp_lat * dest_width_km / lat_to_km)
+        right_dest_lon = predicted_lon - (perp_lon * dest_width_km / lon_to_km)
+        
+        # Construir polígono del cono
+        cone_points = [
+            [left_origin_lon, left_origin_lat],    # Inicio izquierdo
+            [left_dest_lon, left_dest_lat],        # Destino izquierdo
+            [right_dest_lon, right_dest_lat],      # Destino derecho
+            [right_origin_lon, right_origin_lat],  # Inicio derecho
+            [left_origin_lon, left_origin_lat]     # Cerrar polígono
+        ]
+        
+        return cone_points
+
+
+    def perform_forecast_verification(self, current_window_data, previous_predictions):
+        """
+        Verifica pronósticos del tiempo t-1 contra observaciones del tiempo t.
+        
+        Args:
+            current_window_data: Datos actuales observados (tiempo t)
+            previous_predictions: Predicciones hechas en tiempo t-1
+        
+        Returns:
+            verification_results: Lista con resultados de verificación
+        """
+        verification_results = []
+        
+        if not previous_predictions or len(previous_predictions) == 0:
+            return verification_results
+        
+        current_cells = current_window_data.get('cells_gdf', pd.DataFrame())
+        if current_cells.empty:
+            return verification_results
+        
+        logger.info(f"🔍 Verificando {len(previous_predictions)} pronósticos contra {len(current_cells)} observaciones")
+        
+        for pred_idx, prediction in enumerate(previous_predictions):
+            try:
+                track_id = prediction.get('track_id', -1)
+                pred_lat = prediction.get('pred_lat', None)
+                pred_lon = prediction.get('pred_lon', None)
+                pred_time = prediction.get('pred_time', current_window_data['timestamp'])
+                confidence_level = prediction.get('confidence_level', 0.75)
+                forecast_method = prediction.get('forecast_method', 'unknown')
+                expected_error_km = prediction.get('expected_error_km', 10.0)
+                
+                if pred_lat is None or pred_lon is None:
+                    continue
+                
+                # Buscar la celda observada correspondiente al mismo track_id
+                observed_cells = current_cells[current_cells['track_id'] == track_id]
+                
+                if observed_cells.empty:
+                    # El track desapareció - predicción fallida
+                    verification_result = {
+                        'track_id': track_id,
+                        'prediction_time': pred_time - timedelta(minutes=20),  # Tiempo cuando se hizo la predicción
+                        'observation_time': current_window_data['timestamp'],
+                        'predicted_lat': pred_lat,
+                        'predicted_lon': pred_lon,
+                        'observed_lat': None,
+                        'observed_lon': None,
+                        'position_error_km': float('inf'),
+                        'intensity_error_pct': float('inf'),
+                        'was_within_uncertainty': False,
+                        'track_disappeared': True,
+                        'confidence_level': confidence_level,
+                        'forecast_method': forecast_method,
+                        'expected_error_km': expected_error_km
+                    }
+                    verification_results.append(verification_result)
+                    continue
+                
+                # Tomar la celda observada (debería ser única por track_id)
+                observed_cell = observed_cells.iloc[0]
+                obs_lat = observed_cell['centroid_lat']
+                obs_lon = observed_cell['centroid_lon']
+                
+                # Calcular error de posición en km
+                position_error_km = self._calculate_distance_km(pred_lat, pred_lon, obs_lat, obs_lon)
+                
+                # Calcular error de intensidad
+                pred_intensity = prediction.get('pred_n_flashes', 0)
+                obs_intensity = observed_cell.get('n_flashes', 0)
+                
+                if obs_intensity > 0:
+                    intensity_error_pct = abs(pred_intensity - obs_intensity) / obs_intensity * 100
+                else:
+                    intensity_error_pct = 100.0 if pred_intensity > 0 else 0.0
+                
+                # Determinar si estuvo dentro de la incertidumbre esperada
+                was_within_uncertainty = position_error_km <= expected_error_km
+                
+                verification_result = {
+                    'track_id': track_id,
+                    'prediction_time': pred_time - timedelta(minutes=20),
+                    'observation_time': current_window_data['timestamp'],
+                    'predicted_lat': pred_lat,
+                    'predicted_lon': pred_lon,
+                    'observed_lat': obs_lat,
+                    'observed_lon': obs_lon,
+                    'position_error_km': position_error_km,
+                    'intensity_error_pct': intensity_error_pct,
+                    'was_within_uncertainty': was_within_uncertainty,
+                    'track_disappeared': False,
+                    'confidence_level': confidence_level,
+                    'forecast_method': forecast_method,
+                    'expected_error_km': expected_error_km,
+                    'predicted_intensity': pred_intensity,
+                    'observed_intensity': obs_intensity
+                }
+                
+                verification_results.append(verification_result)
+                
+                # Actualizar métricas globales
+                self.performance_metrics['total_predictions'] += 1
+                if was_within_uncertainty:
+                    self.performance_metrics['successful_verifications'] += 1
+                
+                # Actualizar errores promedio
+                total_preds = self.performance_metrics['total_predictions']
+                current_mean_pos = self.performance_metrics['mean_position_error_km']
+                current_mean_int = self.performance_metrics['mean_intensity_error_pct']
+                
+                self.performance_metrics['mean_position_error_km'] = (
+                    (current_mean_pos * (total_preds - 1) + position_error_km) / total_preds
+                )
+                self.performance_metrics['mean_intensity_error_pct'] = (
+                    (current_mean_int * (total_preds - 1) + intensity_error_pct) / total_preds
+                )
+                
+                logger.info(f"✅ Verificación Track {track_id}: Error={position_error_km:.1f}km, Dentro_incertidumbre={was_within_uncertainty}")
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Error verificando predicción {pred_idx}: {e}")
+                continue
+        
+        return verification_results
+
+    def _calculate_distance_km(self, lat1, lon1, lat2, lon2):
+        """Calcula distancia entre dos puntos en km usando aproximación simple."""
+        # Aproximación para distancias cortas
+        lat_diff = lat2 - lat1
+        lon_diff = lon2 - lon1
+        
+        # Convertir a km (aproximadamente)
+        lat_km = lat_diff * 111.0  # 1 grado lat ≈ 111 km
+        lon_km = lon_diff * 111.0 * np.cos(np.radians((lat1 + lat2) / 2))  # Corrección por latitud
+        
+        distance_km = (lat_km**2 + lon_km**2)**0.5
+        return distance_km
+
+    # MODIFICAR EL MÉTODO process_time_window PARA INCLUIR VERIFICACIÓN
+    def process_time_window(self, start_time, end_time, window_index):
+        """Procesa una ventana temporal con verificación de pronósticos."""
+        logger.info(f"Procesando ventana {window_index}: {start_time} - {end_time}")
+            
+        try:
+            # 1. Procesar datos GLM
+            flash_df = self.glm_processor.process_time_window(start_time, end_time)
+            
+            if flash_df.empty:
+                logger.warning(f"No flash data for window {window_index}")
+                return None
+                
+            logger.info(f"Procesados {len(flash_df)} flashes en ventana {window_index}")
+                
+            # 2. Identificar celdas
+            flash_df_with_clusters, cell_polygons, cell_stats = self.cell_identifier.identify_cells(flash_df)
+            cells_gdf = self.cell_identifier.create_cell_geodataframe(cell_polygons, cell_stats)
+                
+            if cells_gdf.empty:
+                logger.warning(f"No cells identified for window {window_index}")
+                return None
+                
+            logger.info(f"Identificadas {len(cells_gdf)} celdas en ventana {window_index}")
+                
+            # 3. Tracking
+            tracked_cells = self.tracker.track_cells(cells_gdf, end_time)
+            logger.info(f"Tracked {len(tracked_cells)} celdas")
+                
+            # 4. VERIFICACIÓN: Verificar pronósticos anteriores contra observaciones actuales
+            verification_results = []
+            if len(self.historical_data) > 0:
+                previous_window = self.historical_data[-1]  # Ventana anterior
+                previous_predictions = previous_window.get('predictions_df', pd.DataFrame())
+                    
+                if not previous_predictions.empty:
+                    current_window_data = {
+                        'timestamp': end_time,
+                        'cells_gdf': tracked_cells
+                    }
+                    verification_results = self.perform_forecast_verification(
+                        current_window_data, 
+                        previous_predictions.to_dict('records')
+                    )
+                
+            # 5. Nowcasting (generar nuevos pronósticos)
+            predictions_df = self.nowcaster.predict_cells(tracked_cells, self.tracker.tracked_cells)
+            logger.info(f"Generadas {len(predictions_df)} predicciones")
+                
+            # 6. Almacenar datos CON verificación
+            window_data = {
+                'timestamp': end_time,
+                'window_index': window_index,
+                'flash_df': flash_df_with_clusters,
+                'cells_gdf': tracked_cells,
+                'predictions_df': predictions_df,
+                'verification_results': verification_results,
+                'track_stats': self.tracker.get_track_statistics()
+            }
+                
+            self.historical_data.append(window_data)
+                
+            # 7. Guardar resultados con verificación
+            timestamp_str = end_time.strftime('%Y%m%d_%H%M%S')
+                
+            # Guardar verificaciones
+            if verification_results:
+                verification_file = os.path.join(self.output_dir, f'verification_{timestamp_str}.csv')
+                verification_df = pd.DataFrame(verification_results)
+                verification_df.to_csv(verification_file, index=False)
+                logger.info(f"Guardadas {len(verification_results)} verificaciones en {verification_file}")
+            
+            # Guardar celdas tracked
+            if not tracked_cells.empty:
+                cells_file = os.path.join(self.output_dir, f'tracked_cells_{timestamp_str}.geojson')
+                try:
+                    tracked_cells.to_file(cells_file, driver='GeoJSON')
+                    logger.info(f"Guardadas {len(tracked_cells)} celdas tracked en {cells_file}")
+                except Exception as e:
+                    logger.warning(f"Error guardando celdas tracked: {e}")
+            
+            # Guardar predicciones
+            if not predictions_df.empty:
+                pred_file = os.path.join(self.output_dir, f'predictions_{timestamp_str}.csv')
+                try:
+                    predictions_df.to_csv(pred_file, index=False)
+                    logger.info(f"Guardadas {len(predictions_df)} predicciones en {pred_file}")
+                except Exception as e:
+                    logger.warning(f"Error guardando predicciones: {e}")
+            
+            # Guardar datos de flashes con clusters (opcional)
+            if not flash_df_with_clusters.empty:
+                flash_file = os.path.join(self.output_dir, f'flashes_clustered_{timestamp_str}.csv')
+                try:
+                    flash_df_with_clusters.to_csv(flash_file, index=False)
+                    logger.info(f"Guardados {len(flash_df_with_clusters)} flashes clustered en {flash_file}")
+                except Exception as e:
+                    logger.warning(f"Error guardando flashes clustered: {e}")
+            
+            # Guardar estadísticas de tracking
+            track_stats = self.tracker.get_track_statistics()
+            if track_stats:
+                stats_file = os.path.join(self.output_dir, f'track_stats_{timestamp_str}.json')
+                try:
+                    with open(stats_file, 'w') as f:
+                        json.dump(track_stats, f, indent=2, default=str)
+                    logger.info(f"Guardadas estadísticas de tracking en {stats_file}")
+                except Exception as e:
+                    logger.warning(f"Error guardando estadísticas de tracking: {e}")
+            
+            # Log de resumen de la ventana
+            logger.info(f"✅ Ventana {window_index} procesada exitosamente:")
+            logger.info(f"   📊 {len(flash_df)} flashes → {len(cells_gdf)} celdas → {len(tracked_cells)} tracked")
+            logger.info(f"   🔮 {len(predictions_df)} predicciones generadas")
+            logger.info(f"   ✅ {len(verification_results)} verificaciones realizadas")
+            
+            # Mostrar información de tracks activos
+            if not tracked_cells.empty and 'track_id' in tracked_cells.columns:
+                unique_tracks = tracked_cells['track_id'].unique()
+                logger.info(f"   🎯 Tracks activos: {list(unique_tracks)}")
+                
+                # Mostrar estadísticas de cada track
+                for track_id in unique_tracks:
+                    track_cells = tracked_cells[tracked_cells['track_id'] == track_id]
+                    if not track_cells.empty:
+                        track_cell = track_cells.iloc[0]
+                        age = track_cell.get('age_minutes', 0)
+                        n_flashes = track_cell.get('n_flashes', 0)
+                        area = track_cell.get('area_km2', 0)
+                        logger.info(f"      Track {track_id}: {age:.1f}min, {n_flashes}⚡, {area:.1f}km²")
+            
+            return window_data
+                
+        except Exception as e:
+            logger.error(f"❌ Error procesando ventana {window_index}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def _add_complete_performance_panel(self, folium_map, latest_data):
         
@@ -964,9 +1522,9 @@ class ConsolidatedNowcastingSystem:
         folium_map.get_root().html.add_child(folium.Element(verification_html))
 
     def _add_uncertainty_legend_to_map(self, folium_map):
-       
+        """Agrega leyenda actualizada con líneas verdes."""
+        
         import folium
-        """Agrega leyenda de incertidumbre al mapa."""
         
         legend_html = '''
         <div style="position: fixed; bottom: 10px; right: 10px; z-index: 1000; 
@@ -976,33 +1534,46 @@ class ConsolidatedNowcastingSystem:
             <h4 style="margin-top: 0; text-align: center; color: #333;">🎯 Leyenda</h4>
             
             <div style="margin-bottom: 8px;">
-                <h5 style="margin: 5px 0; color: #666;">Celdas de Tormenta:</h5>
+                <h5 style="margin: 5px 0; color: #666;">Tormentas Actuales:</h5>
                 <div style="display: flex; align-items: center; margin-bottom: 3px;">
-                    <span style="display: inline-block; width: 15px; height: 15px; background-color: #FF0000; margin-right: 5px;"></span>
-                    <span style="font-size: 11px;">Track activo</span>
+                    <span style="display: inline-block; width: 15px; height: 15px; background-color: #0000FF; opacity: 0.4; border: 2px solid #0000FF; margin-right: 5px;"></span>
+                    <span style="font-size: 11px;">Área de tormenta (azul)</span>
                 </div>
                 <div style="display: flex; align-items: center; margin-bottom: 3px;">
-                    <span style="display: inline-block; width: 15px; height: 15px; background-color: #FF00FF; margin-right: 5px;"></span>
-                    <span style="font-size: 11px;">Predicción</span>
+                    <span style="display: inline-block; width: 15px; height: 3px; background-color: #006400; margin-right: 5px; border-style: dashed; border-width: 2px;"></span>
+                    <span style="font-size: 11px;">Trayectoria histórica (verde)</span>
+                </div>
+                <div style="display: flex; align-items: center; margin-bottom: 3px;">
+                    <span style="display: inline-block; width: 15px; height: 15px; background-color: white; border: 2px solid #000000; border-radius: 50%; margin-right: 5px;"></span>
+                    <span style="font-size: 11px;">Centro actual</span>
                 </div>
             </div>
             
             <div style="margin-bottom: 8px;">
-                <h5 style="margin: 5px 0; color: #666;">Verificación:</h5>
+                <h5 style="margin: 5px 0; color: #666;">Pronósticos:</h5>
                 <div style="display: flex; align-items: center; margin-bottom: 3px;">
-                    <span style="display: inline-block; width: 15px; height: 15px; background-color: green; border-radius: 50%; margin-right: 5px;"></span>
-                    <span style="font-size: 11px;">Predicción exitosa</span>
+                    <span style="display: inline-block; width: 15px; height: 15px; background-color: #FF0000; opacity: 0.6; margin-right: 5px;"></span>
+                    <span style="font-size: 11px;">Probabilidad 60% (rojo)</span>
                 </div>
                 <div style="display: flex; align-items: center; margin-bottom: 3px;">
-                    <span style="display: inline-block; width: 15px; height: 15px; background-color: red; border-radius: 50%; margin-right: 5px;"></span>
-                    <span style="font-size: 11px;">Predicción fallida</span>
+                    <span style="display: inline-block; width: 15px; height: 15px; background-color: #FF0000; opacity: 0.4; margin-right: 5px;"></span>
+                    <span style="font-size: 11px;">Probabilidad 80% (rojo)</span>
+                </div>
+                <div style="display: flex; align-items: center; margin-bottom: 3px;">
+                    <span style="display: inline-block; width: 15px; height: 15px; background-color: #FF0000; opacity: 0.25; margin-right: 5px;"></span>
+                    <span style="font-size: 11px;">Probabilidad 90% (rojo)</span>
+                </div>
+                <div style="display: flex; align-items: center; margin-bottom: 3px;">
+                    <span style="display: inline-block; width: 15px; height: 15px; background-color: #FF00FF; margin-right: 5px;"></span>
+                    <span style="font-size: 11px;">Centro predicción</span>
                 </div>
             </div>
             
             <div style="font-size: 10px; color: #666; border-top: 1px solid #ddd; padding-top: 5px;">
                 <b>🎮 Controles:</b> Play/Pause, Loop, Velocidad<br>
                 <b>🔮 Pronóstico:</b> +20 minutos<br>
-                <b>📊 Intervalos:</b> 40%, 60%, 80%, 90%
+                <b>⏱️ Animación:</b> 10 min/frame<br>
+                <b>🛤️ Trayectorias:</b> Verde punteado
             </div>
         </div>
         '''
@@ -1043,6 +1614,57 @@ class ConsolidatedNowcastingSystem:
             json.dump(stats, f, indent=2, default=str)
         
         logger.info(f"Reporte de rendimiento guardado en: {report_file}")
+
+
+    def debug_trajectory_generation(self):
+        """Debug específico para ver por qué no aparecen las líneas."""
+        logger.info("🔍 DEBUG DETALLADO: Generación de trayectorias")
+        
+        # Verificar datos básicos
+        logger.info(f"Total ventanas históricas: {len(self.historical_data)}")
+        
+        # Recopilar tracks como lo hace el código principal
+        track_history = {}
+        for window_idx, window_data in enumerate(self.historical_data):
+            timestamp = window_data['timestamp']
+            cells_gdf = window_data.get('cells_gdf', pd.DataFrame())
+            
+            logger.info(f"Ventana {window_idx} ({timestamp.strftime('%H:%M')}): {len(cells_gdf)} celdas")
+            
+            if not cells_gdf.empty:
+                for _, cell in cells_gdf.iterrows():
+                    track_id = cell.get('track_id', -1)
+                    if track_id != -1:
+                        if track_id not in track_history:
+                            track_history[track_id] = []
+                        
+                        track_history[track_id].append({
+                            'window_idx': window_idx,
+                            'timestamp': timestamp,
+                            'lat': cell.get('centroid_lat', 0),
+                            'lon': cell.get('centroid_lon', 0),
+                            'cell_data': cell
+                        })
+                        logger.info(f"   Track {track_id}: [{cell.get('centroid_lat', 0):.4f}, {cell.get('centroid_lon', 0):.4f}]")
+        
+        # Verificar tracks con múltiples posiciones
+        logger.info("📊 Análisis de tracks para trayectorias:")
+        for track_id, positions in track_history.items():
+            positions.sort(key=lambda x: x['timestamp'])
+            logger.info(f"   Track {track_id}: {len(positions)} posiciones")
+            
+            if len(positions) >= 2:
+                logger.info(f"      ✅ PUEDE GENERAR TRAYECTORIA")
+                for i, pos in enumerate(positions):
+                    logger.info(f"         {i+1}. {pos['timestamp'].strftime('%H:%M')} -> [{pos['lat']:.4f}, {pos['lon']:.4f}]")
+                
+                # Probar crear coordenadas de línea
+                test_coords = [[pos['lon'], pos['lat']] for pos in positions]
+                logger.info(f"      🧪 Coordenadas de línea: {test_coords}")
+            else:
+                logger.info(f"      ❌ INSUFICIENTE PARA TRAYECTORIA (necesita ≥2)")
+        
+        return track_history
 
 def parse_arguments():
     """Parsea argumentos de línea de comandos - ACEPTA ARGUMENTOS REALES."""
